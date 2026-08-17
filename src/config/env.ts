@@ -34,6 +34,7 @@ import {
   OPENAI_CHATGPT_REFRESH_TOKEN_ENV_KEY,
   OPENAI_COMPATIBLE_API_KEY_ENV_KEY,
   OPENAI_COMPATIBLE_BASE_URL_ENV_KEY,
+  OPENAI_COMPATIBLE_STREAMING_ENV_KEY,
   OPENAI_COMPATIBLE_USE_RESPONSES_API_ENV_KEY,
   OPENWIKI_GOOGLE_ACCESS_TOKEN_ENV_KEY,
   OPENWIKI_GOOGLE_CLIENT_ID_ENV_KEY,
@@ -59,9 +60,11 @@ import {
   OPENWIKI_TAVILY_API_KEY_ENV_KEY,
   OPENWIKI_MODEL_ID_ENV_KEY,
   OPENWIKI_PROVIDER_ENV_KEY,
+  OPENWIKI_REASONING_EFFORT_ENV_KEY,
   OPENWIKI_PROVIDER_RETRY_ATTEMPTS_ENV_KEY,
   resolveProviderRetryAttempts,
 } from "./constants.js";
+import { isReasoningEffort } from "./reasoning.js";
 import { isFileNotFoundError } from "../platform/fs-errors.js";
 import { restrictDirToCurrentUser } from "../platform/windows-acl.js";
 
@@ -110,6 +113,7 @@ export const MANAGED_ENV_KEYS = [
   OPENAI_CHATGPT_PLAN_ENV_KEY,
   OPENAI_COMPATIBLE_API_KEY_ENV_KEY,
   OPENAI_COMPATIBLE_BASE_URL_ENV_KEY,
+  OPENAI_COMPATIBLE_STREAMING_ENV_KEY,
   OPENAI_COMPATIBLE_USE_RESPONSES_API_ENV_KEY,
   ANTHROPIC_API_KEY_ENV_KEY,
   ANTHROPIC_BASE_URL_ENV_KEY,
@@ -126,6 +130,7 @@ export const MANAGED_ENV_KEYS = [
   OPENWIKI_PROVIDER_ENV_KEY,
   OPENWIKI_MODEL_ID_ENV_KEY,
   OPENWIKI_PROVIDER_RETRY_ATTEMPTS_ENV_KEY,
+  OPENWIKI_REASONING_EFFORT_ENV_KEY,
   OPENWIKI_NOTION_TOKEN_ENV_KEY,
   OPENWIKI_NOTION_MCP_CLIENT_ID_ENV_KEY,
   OPENWIKI_NOTION_MCP_ACCESS_TOKEN_ENV_KEY,
@@ -386,12 +391,15 @@ function createCredentialDiagnostic(
         ? getModelWarnings(value)
         : key === OPENWIKI_PROVIDER_ENV_KEY
           ? getProviderWarnings(value)
-          : key === OPENAI_COMPATIBLE_USE_RESPONSES_API_ENV_KEY
+          : key === OPENAI_COMPATIBLE_USE_RESPONSES_API_ENV_KEY ||
+              key === OPENAI_COMPATIBLE_STREAMING_ENV_KEY
             ? getBooleanWarnings(value)
             : key === OPENWIKI_PROVIDER_RETRY_ATTEMPTS_ENV_KEY
               ? getRetryAttemptsWarnings(value)
-              : (getBaseUrlDiagnosticWarnings(key, value) ??
-                getCredentialWarnings(value)),
+              : key === OPENWIKI_REASONING_EFFORT_ENV_KEY
+                ? getReasoningEffortWarnings(value)
+                : (getBaseUrlDiagnosticWarnings(key, value) ??
+                  getCredentialWarnings(value)),
   };
 }
 
@@ -450,9 +458,11 @@ function isNonSecretDiagnosticKey(key: string): boolean {
     key === OPENWIKI_MODEL_ID_ENV_KEY ||
     key === OPENWIKI_PROVIDER_ENV_KEY ||
     key === OPENWIKI_PROVIDER_RETRY_ATTEMPTS_ENV_KEY ||
+    key === OPENWIKI_REASONING_EFFORT_ENV_KEY ||
     key === OPENWIKI_OPENROUTER_MAX_TOKENS_ENV_KEY ||
     key === OPENWIKI_OPENROUTER_PROVIDER_ONLY_ENV_KEY ||
     key === OPENAI_COMPATIBLE_USE_RESPONSES_API_ENV_KEY ||
+    key === OPENAI_COMPATIBLE_STREAMING_ENV_KEY ||
     key === ANTHROPIC_BASE_URL_ENV_KEY ||
     key === BASETEN_BASE_URL_ENV_KEY ||
     key === COPILOT_BASE_URL_ENV_KEY ||
@@ -521,6 +531,10 @@ function getRetryAttemptsWarnings(value: string): string[] {
   } catch {
     return ["invalid retry attempts"];
   }
+}
+
+function getReasoningEffortWarnings(value: string): string[] {
+  return isReasoningEffort(value.trim()) ? [] : ["invalid reasoning effort"];
 }
 
 async function readOpenWikiEnv(): Promise<EnvMap> {

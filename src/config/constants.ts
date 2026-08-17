@@ -14,8 +14,12 @@ export const OPENAI_API_KEY_ENV_KEY = "OPENAI_API_KEY";
 export const OPENAI_BASE_URL_ENV_KEY = "OPENAI_BASE_URL";
 export const OPENAI_COMPATIBLE_API_KEY_ENV_KEY = "OPENAI_COMPATIBLE_API_KEY";
 export const OPENAI_COMPATIBLE_BASE_URL_ENV_KEY = "OPENAI_COMPATIBLE_BASE_URL";
+export const OPENAI_COMPATIBLE_STREAMING_ENV_KEY =
+  "OPENWIKI_OPENAI_COMPATIBLE_STREAMING";
 export const OPENAI_COMPATIBLE_USE_RESPONSES_API_ENV_KEY =
   "OPENWIKI_OPENAI_COMPATIBLE_USE_RESPONSES_API";
+export const OPENAI_COMPATIBLE_STREAM_MESSAGES_ENV_KEY =
+  "OPENWIKI_OPENAI_COMPATIBLE_STREAM_MESSAGES";
 export const OPENAI_CHATGPT_ACCESS_TOKEN_ENV_KEY =
   "OPENAI_CHATGPT_ACCESS_TOKEN";
 export const OPENAI_CHATGPT_REFRESH_TOKEN_ENV_KEY =
@@ -56,6 +60,7 @@ export const OPENWIKI_MODEL_ID_ENV_KEY = "OPENWIKI_MODEL_ID";
 export const NEBIUS_BASE_URL = "https://api.tokenfactory.nebius.com/v1/";
 export const OPENWIKI_PROVIDER_RETRY_ATTEMPTS_ENV_KEY =
   "OPENWIKI_PROVIDER_RETRY_ATTEMPTS";
+export const OPENWIKI_REASONING_EFFORT_ENV_KEY = "OPENWIKI_REASONING_EFFORT";
 export const DEFAULT_PROVIDER_RETRY_ATTEMPTS = 3;
 const TRUE_ENV_VALUE = "true";
 export const OPENWIKI_GOOGLE_ACCESS_TOKEN_ENV_KEY =
@@ -464,6 +469,14 @@ export function providerUsesResponsesApi(
   return (
     setting === true || (setting instanceof RegExp && setting.test(modelId))
   );
+}
+
+export function providerUsesStreaming(provider: OpenWikiProvider): boolean {
+  if (provider === "openai-compatible") {
+    return resolveOpenAiCompatibleStreaming();
+  }
+
+  return false;
 }
 
 export function getProviderProjectEnvKey(
@@ -922,6 +935,50 @@ export function resolveOpenAiCompatibleUseResponsesApi(
 ): boolean {
   return (
     env[OPENAI_COMPATIBLE_USE_RESPONSES_API_ENV_KEY]?.trim().toLowerCase() ===
+    TRUE_ENV_VALUE
+  );
+}
+
+// Opt-in to keep "messages" stream mode for openai-compatible endpoints.
+//
+// The "messages" stream mode makes @langchain/core route `.invoke()`
+// through `_streamResponseChunks` chunk aggregation. Providers that emit
+// reasoning deltas before the first `role: "assistant"` delta (z.ai GLM
+// via https://api.z.ai/api/coding/paas/v4) aggregate to a
+// ChatMessageChunk instead of an AIMessage, which the agent loop's
+// wrapModelCall validator rejects ("expected AIMessage or Command, got
+// object" — issue #659). Dropping "messages" forces the non-streaming
+// `_generate` path, which returns a proper AIMessage at the cost of
+// live token streaming in the TUI. Endpoints known to emit a
+// role:"assistant" first delta can opt back in with the env below.
+export function resolveOpenAiCompatibleStreamMessages(
+  env: NodeJS.ProcessEnv = process.env,
+): boolean {
+  return (
+    env[OPENAI_COMPATIBLE_STREAM_MESSAGES_ENV_KEY]?.trim().toLowerCase() ===
+    TRUE_ENV_VALUE
+  );
+}
+
+// Some OpenAI-compatible gateways only serve the streaming transport: a
+// non-streaming request either gets rejected ("Stream must be set to true") or
+// returns HTTP 200 with empty content. DeepAgents' agent node issues
+// non-streaming `.invoke()` calls internally, so those deployments fail
+// silently — the run finishes with a blank wiki and no error. Opting in forces
+// the streaming transport for every generation, the same transport override the
+// openai-chatgpt provider hardcodes for the Codex backend.
+//
+// This is the HTTP transport, a different axis from the stream mode above:
+// OPENWIKI_OPENAI_COMPATIBLE_STREAM_MESSAGES controls how LangGraph surfaces a
+// run in the TUI, while this controls whether the request itself is sent as SSE.
+//
+// It stays opt-in because this provider points at arbitrary third-party
+// endpoints, where SSE is not guaranteed to survive proxies and load balancers.
+export function resolveOpenAiCompatibleStreaming(
+  env: NodeJS.ProcessEnv = process.env,
+): boolean {
+  return (
+    env[OPENAI_COMPATIBLE_STREAMING_ENV_KEY]?.trim().toLowerCase() ===
     TRUE_ENV_VALUE
   );
 }

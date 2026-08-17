@@ -28,7 +28,9 @@ import {
   providerRequiresRegion,
   providerRequiresSecretKey,
   providerUsesAwsSdkCredentials,
+  providerUsesStreaming,
   resolveConfiguredProvider,
+  resolveOpenAiCompatibleStreaming,
   resolveOpenAiCompatibleUseResponsesApi,
   resolveOpenRouterMaxTokens,
   resolveOpenRouterProviderOnly,
@@ -37,6 +39,10 @@ import {
   resolveProviderRegion,
   resolveProviderRetryAttempts,
 } from "../../src/config/constants.ts";
+import {
+  getReasoningCapability,
+  resolveReasoningConfig,
+} from "../../src/config/reasoning.ts";
 
 describe("isValidModelId", () => {
   test("accepts normal provider/model ids", () => {
@@ -286,6 +292,61 @@ describe("resolveProviderRetryAttempts", () => {
   });
 });
 
+describe("reasoning capabilities", () => {
+  test("returns the configured capability for the initial OpenAI and NVIDIA models", () => {
+    expect(getReasoningCapability("openai", "gpt-5.6-luna")).toEqual({
+      transport: "responses-reasoning",
+      values: ["none", "low", "medium", "high", "xhigh", "max"],
+    });
+    expect(
+      getReasoningCapability("nvidia", "nvidia/nemotron-3-super-120b-a12b"),
+    ).toEqual({
+      transport: "chat-completions-reasoning-effort",
+      values: ["none", "low", "high"],
+    });
+  });
+
+  test("leaves reasoning unset when the environment variable is absent", () => {
+    expect(
+      resolveReasoningConfig("openai", "gpt-5.6-luna", {}),
+    ).toBeUndefined();
+  });
+
+  test("resolves supported values for OpenAI and NVIDIA NIM", () => {
+    expect(
+      resolveReasoningConfig("openai-chatgpt", "gpt-5.6-luna", {
+        OPENWIKI_REASONING_EFFORT: " max ",
+      }),
+    ).toEqual({ effort: "max", transport: "responses-reasoning" });
+    expect(
+      resolveReasoningConfig("nvidia", "nvidia/nemotron-3-super-120b-a12b", {
+        OPENWIKI_REASONING_EFFORT: "high",
+      }),
+    ).toEqual({
+      effort: "high",
+      transport: "chat-completions-reasoning-effort",
+    });
+  });
+
+  test("rejects invalid or unsupported reasoning effort settings before a request", () => {
+    expect(() =>
+      resolveReasoningConfig("openai", "gpt-5.6-luna", {
+        OPENWIKI_REASONING_EFFORT: "fast",
+      }),
+    ).toThrow(/Invalid OPENWIKI_REASONING_EFFORT/u);
+    expect(() =>
+      resolveReasoningConfig("nvidia", "nvidia/nemotron-3-super-120b-a12b", {
+        OPENWIKI_REASONING_EFFORT: "max",
+      }),
+    ).toThrow(/Supported values: none, low, high/u);
+    expect(() =>
+      resolveReasoningConfig("nvidia", "openai/gpt-oss-120b", {
+        OPENWIKI_REASONING_EFFORT: "high",
+      }),
+    ).toThrow(/not supported/u);
+  });
+});
+
 describe("resolveOpenRouterProviderOnly", () => {
   test("returns undefined when no provider pin is configured", () => {
     expect(resolveOpenRouterProviderOnly({})).toBeUndefined();
@@ -334,6 +395,67 @@ describe("resolveOpenAiCompatibleUseResponsesApi", () => {
         OPENWIKI_OPENAI_COMPATIBLE_USE_RESPONSES_API: "false",
       }),
     ).toBe(false);
+  });
+});
+
+describe("resolveOpenAiCompatibleStreaming", () => {
+  test("leaves the transport at the client default", () => {
+    expect(resolveOpenAiCompatibleStreaming({})).toBe(false);
+  });
+
+  test("only forces streaming for an explicit true opt-in", () => {
+    expect(
+      resolveOpenAiCompatibleStreaming({
+        OPENWIKI_OPENAI_COMPATIBLE_STREAMING: "true",
+      }),
+    ).toBe(true);
+    expect(
+      resolveOpenAiCompatibleStreaming({
+        OPENWIKI_OPENAI_COMPATIBLE_STREAMING: " TRUE ",
+      }),
+    ).toBe(true);
+    expect(
+      resolveOpenAiCompatibleStreaming({
+        OPENWIKI_OPENAI_COMPATIBLE_STREAMING: "false",
+      }),
+    ).toBe(false);
+  });
+});
+
+describe("providerUsesStreaming", () => {
+  test("stays off for openai-compatible without the opt-in", () => {
+    delete process.env.OPENWIKI_OPENAI_COMPATIBLE_STREAMING;
+
+    expect(providerUsesStreaming("openai-compatible")).toBe(false);
+  });
+
+  test("forces streaming for openai-compatible when opted in", () => {
+    process.env.OPENWIKI_OPENAI_COMPATIBLE_STREAMING = "true";
+
+    try {
+      expect(providerUsesStreaming("openai-compatible")).toBe(true);
+    } finally {
+      delete process.env.OPENWIKI_OPENAI_COMPATIBLE_STREAMING;
+    }
+  });
+
+  test("never applies to the other providers sharing the ChatOpenAI branch", () => {
+    process.env.OPENWIKI_OPENAI_COMPATIBLE_STREAMING = "true";
+
+    try {
+      for (const provider of [
+        "openai",
+        "baseten",
+        "copilot",
+        "fireworks",
+        "nebius",
+        "nvidia",
+      ] as const) {
+        expect(providerUsesStreaming(provider)).toBe(false);
+      }
+    } finally {
+      delete process.env.OPENWIKI_OPENAI_COMPATIBLE_STREAMING;
+    }
   });
 });
 
