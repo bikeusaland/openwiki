@@ -104,6 +104,7 @@ import {
   NVIDIA_BASE_URL_ENV_KEY,
   OPENAI_BASE_URL_ENV_KEY,
   OPENAI_COMPATIBLE_BASE_URL_ENV_KEY,
+  OPENAI_COMPATIBLE_STREAMING_ENV_KEY,
   OPENROUTER_API_KEY_ENV_KEY,
   OPENROUTER_BASE_URL,
   OPENWIKI_MODEL_ID_ENV_KEY,
@@ -115,7 +116,9 @@ import {
   providerUsesAwsSdkCredentials,
   providerUsesExternalCliAuth,
   providerUsesResponsesApi,
+  providerUsesStreaming,
   resolveConfiguredProvider,
+  resolveOpenAiCompatibleStreamMessages,
   resolveOpenRouterMaxTokens,
   resolveOpenRouterProviderOnly,
   resolveProviderBaseUrl,
@@ -124,6 +127,7 @@ import {
   resolveProviderRetryAttempts,
   type OpenWikiProvider,
 } from "../config/constants.js";
+import { resolveReasoningConfig } from "../config/reasoning.js";
 import {
   resolveExternalCliCredential,
   validateExternalCliCredential,
@@ -135,6 +139,7 @@ import {
   persistRunMetadataIfChanged,
   removeTemporaryPlanFile,
   shouldCheckUpdateNoop,
+  writeLastUpdateMetadata,
 } from "./utils.js";
 import { clearActiveRun, registerActiveRun } from "./crash-guard.js";
 import { inStage, inStageSync, tagErrorStage } from "../telemetry/index.js";
@@ -174,13 +179,34 @@ export async function runOpenWikiAgent(
   );
 
   if (command === "update" && shouldCheckUpdateNoop(options)) {
-    const noopStatus = await getUpdateNoopStatus(cwd, openWikiIgnore);
+    const noopStatus = await getUpdateNoopStatus(
+      cwd,
+      openWikiIgnore,
+      options.language,
+    );
 
     if (noopStatus.shouldSkip) {
       const message =
         "No repository changes detected since the last OpenWiki update; skipping agent run.";
       emitDebug(options, `update.noop gitHead=${noopStatus.gitHead}`);
       options.onEvent?.({ type: "text", text: message });
+
+      // Refresh .last-update.json even on a fast-skip no-op so freshness
+      // checks reflect the actual last run, not the last content change.
+      // The persisted language is carried through so a non-English wiki keeps
+      // its marker; dropping it would make the next real update revert to "en".
+      try {
+        await writeLastUpdateMetadata(
+          command,
+          cwd,
+          noopStatus.model ?? "",
+          options.outputMode ?? "local-wiki",
+          "complete",
+          noopStatus.language,
+        );
+      } catch {
+        // Best-effort: a metadata refresh must never block the no-op path.
+      }
 
       // The single telemetry boundary (withRunTelemetry) owns the record; publish
       // the short-circuit outcome and provider onto the shared context and return.
@@ -518,7 +544,21 @@ async function runOpenWikiAgentCore(
     ],
   };
 
-  emitDebug(options, "stream=opening modes=messages,tools subgraphs=true");
+  // "messages" stream mode forces @langchain/core to route the model's
+  // `.invoke()` through chunk aggregation. Providers that stream reasoning
+  // deltas before the first `role: "assistant"` delta (z.ai GLM) aggregate to
+  // a ChatMessageChunk, which the agent loop's wrapModelCall validator
+  // rejects: `expected AIMessage or Command, got object` (issue #659). The
+  // openai-compatible provider can point at any endpoint, so it gets the
+  // safe "updates" mode by default; known-good endpoints can opt back in
+  // with OPENWIKI_OPENAI_COMPATIBLE_STREAM_MESSAGES=true.
+  const streamMessagesEnabled =
+    provider !== "openai-compatible" || resolveOpenAiCompatibleStreamMessages();
+  const streamModes = streamMessagesEnabled
+    ? (["messages", "tools"] as const)
+    : (["updates", "tools"] as const);
+  const streamModesLabel = streamModes.join(",");
+  emitDebug(options, `stream=opening modes=${streamModesLabel} subgraphs=true`);
   const stream = await inStage(
     "build",
     () =>
@@ -526,12 +566,12 @@ async function runOpenWikiAgentCore(
         configurable: {
           thread_id: threadId,
         },
-        streamMode: ["messages", "tools"],
+        streamMode: [...streamModes],
         subgraphs: true,
       }),
     { errorClass: "build_error", errorDetail: "stream_open" },
   );
-  emitDebug(options, "stream=started modes=messages,tools subgraphs=true");
+  emitDebug(options, `stream=started modes=${streamModesLabel} subgraphs=true`);
 
   // Register with the crash guard for exactly the stream-consumption window: a
   // subagent rejection surfaces on the microtask queue during streaming and escapes
@@ -1043,6 +1083,19 @@ export function createModel(
   providerRetryAttempts: number,
 ) {
   const retryOptions = { maxRetries: providerRetryAttempts };
+  const reasoningConfig = resolveReasoningConfig(provider, modelId);
+
+  // GPT-5.6 supports `max` before some OpenAI SDK type unions include it. The
+  // documented Responses payload is still `reasoning: { effort }`, so keep the
+  // compatibility cast narrowly at the ChatOpenAI constructor boundary.
+  const responsesReasoningOptions =
+    reasoningConfig?.transport === "responses-reasoning"
+      ? { reasoning: { effort: reasoningConfig.effort as never } }
+      : {};
+  const chatCompletionsReasoningOptions =
+    reasoningConfig?.transport === "chat-completions-reasoning-effort"
+      ? { modelKwargs: { reasoning_effort: reasoningConfig.effort } }
+      : {};
 
   if (provider === "gemini") {
     return new ChatGoogle({
@@ -1110,6 +1163,7 @@ export function createModel(
       // every generation — including the non-streaming `.invoke()` calls
       // DeepAgents' agent node issues internally.
       streaming: true,
+      ...responsesReasoningOptions,
       ...retryOptions,
       configuration: {
         baseURL: CODEX_RESPONSES_BASE_URL,
@@ -1157,6 +1211,13 @@ export function createModel(
       : undefined,
     model: modelId,
     useResponsesApi: providerUsesResponsesApi(provider, modelId),
+    ...responsesReasoningOptions,
+    ...chatCompletionsReasoningOptions,
+    // Some gateways only serve the streaming transport; see
+    // resolveOpenAiCompatibleStreaming for the full rationale. Spread rather
+    // than assigning a boolean: `streaming: false` is not the same as omitting
+    // the key, because LangChain turns it into `disableStreaming`.
+    ...(providerUsesStreaming(provider) ? { streaming: true } : {}),
     ...retryOptions,
   });
 }
@@ -2064,6 +2125,7 @@ export function formatEnvironmentDebugValue(
     key === OPENWIKI_MODEL_ID_ENV_KEY ||
     key === OPENWIKI_PROVIDER_ENV_KEY ||
     key === OPENWIKI_PROVIDER_RETRY_ATTEMPTS_ENV_KEY ||
+    key === OPENAI_COMPATIBLE_STREAMING_ENV_KEY ||
     key === BEDROCK_AWS_REGION_ENV_KEY
   ) {
     return `set(value=${JSON.stringify(value)})`;
