@@ -25,8 +25,12 @@ OpenWiki is a TypeScript CLI that writes and maintains documentation for a repos
 - Stamps a `build_channel` (`official` / `community`) into each telemetry event at build time so fork-originated telemetry can be filtered from the official-release signal.
 - Validates the selected OpenAI model against the API key's model catalogue before inference, aborting early when the model is unavailable to the configured credentials.
 - Caps OpenRouter per-request output tokens with `OPENWIKI_OPENROUTER_MAX_TOKENS` to avoid 402 credit-pre-check failures on low balances.
-- Lets the openai-compatible provider opt into OpenAI's Responses API with `OPENWIKI_OPENAI_COMPATIBLE_USE_RESPONSES_API=true` (default chat completions), so a gateway exposing a Responses-compatible endpoint uses the Responses-API tool-calling/SSE path. The openai-compatible provider also defaults to non-streaming `updates` stream mode (instead of `messages`) to avoid a `ChatMessageChunk` validator crash on endpoints that stream reasoning deltas before the first `role:"assistant"` delta (z.ai GLM, issue #659); set `OPENWIKI_OPENAI_COMPATIBLE_STREAM_MESSAGES=true` to restore live token streaming for known-good endpoints.
+- Lets the openai-compatible provider opt into OpenAI's Responses API with `OPENWIKI_OPENAI_COMPATIBLE_USE_RESPONSES_API=true` (default chat completions), so a gateway exposing a Responses-compatible endpoint uses the Responses-API tool-calling/SSE path. The openai-compatible provider also defaults to non-streaming `updates` stream mode (instead of `messages`) to avoid a `ChatMessageChunk` validator crash on endpoints that stream reasoning deltas before the first `role:"assistant"` delta (z.ai GLM, issue #659); set `OPENWIKI_OPENAI_COMPATIBLE_STREAM_MESSAGES=true` to restore live token streaming for known-good endpoints. Separately, `OPENWIKI_OPENAI_COMPATIBLE_STREAMING=true` forces the HTTP streaming transport (SSE) for gateways that only serve the streaming transport and otherwise return HTTP 200 with empty content (#655).
+- Caps per-request output tokens with `OPENWIKI_MAX_OUTPUT_TOKENS` (positive integer), applied as `maxTokens`/`maxOutputTokens` across every provider's model client; and for the Bedrock provider exposes `OPENWIKI_STREAM_IDLE_TIMEOUT` (milliseconds, `0` disables the watchdog) to control how long the client waits for the first or next streamed chunk.
+- Configures reasoning effort with `OPENWIKI_REASONING_EFFORT` for supported OpenAI GPT-5.6 models (Responses API `none`/`low`/`medium`/`high`/`xhigh`/`max`) and NVIDIA NIM Nemotron 3 Super (`none`/`low`/`high` via chat-completions `reasoning_effort`), selectable interactively via `/effort`; invalid provider/model/effort combinations fail before a request is sent.
+- Refreshes `openwiki/.last-update.json` on every non-chat run (not only when content changed) so freshness checks reflect the actual last run, while still scoping the git change summary and interrupted-status recovery with the content snapshot.
 - Offers a built-in `custom-mcp` connector so a personal-wiki run can ingest from any read-only MCP server without a dedicated connector, and gates all connector tools to personal/local-wiki runs so code-mode runs never make credentialed external fetches.
+- Emits OKF v0.2 concept front matter and stamps the code-owned `generated: {by: openwiki/<version>, at: <run time>}` provenance event deterministically on every concept write whose body meaningfully changes, dropping the superseded legacy `timestamp` at the same time; the v0.2 provenance/trust/lifecycle families (`generated`, `verified`, `sources`, `status`, `stale_after`) are validated when present (the legacy `timestamp` stays tolerated).
 
 ## Start here
 
@@ -65,14 +69,15 @@ OpenWiki is a TypeScript CLI that writes and maintains documentation for a repos
 - `src/auth/configure.ts` — `openwiki auth configure <provider>` flow for creating local connector configs.
 - `src/auth/ngrok.ts` — Slack HTTPS callback tunnel via ngrok.
 - `src/auth/tokens.ts` — token refresh and validation helpers for connector OAuth.
-- `src/agent/okf-middleware.ts` — OKF front-matter migration and index synchronization middleware; its finalize stage also validates Mermaid fences and internal wiki links.
+- `src/agent/okf-middleware.ts` — OKF front-matter migration, deterministic `generated` provenance stamping on concept writes, and index synchronization middleware; its finalize stage also validates Mermaid fences and internal wiki links.
 - `src/agent/wiki-link-validator.ts` — validates internal links repo-wide (not just the `openwiki/` subtree) and GitHub-style heading anchors on Markdown targets after generation, stamping broken links inline instead of failing the run.
 - `src/agent/translation-middleware.ts` — wiki translation middleware for output-language switching.
 - `src/agent/vertex-surface.ts` — Vertex AI model routing for the gemini-enterprise provider.
 - `src/agent/skills.ts` — bundles and syncs the `/skills/` directory into the agent runtime.
 - `src/auth/external-cli-auth.ts` — GitHub CLI-based credential resolution for the copilot provider.
 - `src/platform/diagnostics.ts` — secret redaction and credential diagnostics.
-- `src/okf/` — OKF front-matter validation, index-label localization, and deterministic index synchronization.
+- `src/okf/` — OKF front-matter validation (v0.2 provenance/trust/lifecycle families), index-label localization, and deterministic index synchronization.
+- `src/version.ts` — `OPENWIKI_VERSION` read from `package.json` at runtime, and `OPENWIKI_PRODUCER_ACTOR` (`openwiki/<version>`) stamped as the `by` actor on OKF v0.2 `generated` provenance events.
 - `src/mermaid/` — Mermaid fence extraction, validation, and wiki repair.
 - `src/telemetry/` — anonymous usage telemetry with PostHog, opt-out, CI sentinel IDs, error classification/fingerprinting, and a baked-in `build_channel` stamp.
 - `scripts/stamp-build-channel.cjs` — release-only build-time rewrite of `BUILD_CHANNEL` in `src/telemetry/gates.ts` from `"community"` to `"official"` for npm-published upstream builds, driven by `OPENWIKI_BUILD_CHANNEL` in `.github/workflows/release.yml`.
@@ -81,7 +86,9 @@ OpenWiki is a TypeScript CLI that writes and maintains documentation for a repos
 - `src/ingestion/code-mode.ts` — `openwiki code` setup: creates the GitHub Actions workflow only when missing (preserving customizations on update) and refreshes AGENTS.md (full instructions) and CLAUDE.md (a pointer to AGENTS.md) snippets.
 - `src/config/env.ts` — `~/.openwiki/.env` persistence and credential diagnostics.
 - `src/setup/credentials.tsx` — interactive onboarding flow entrypoint (thin re-export over `src/setup/credentials/` modules: `steps.ts`, `view.tsx`, `use-init-setup.ts`, `persistence.ts`, `format.ts`, `constants.ts`, `types.ts`).
-- `src/config/constants.ts` — provider configs, model options, env keys, and validation helpers (including `resolveOpenRouterMaxTokens` and `resolveOpenAiCompatibleUseResponsesApi`).
+- `src/config/constants.ts` — provider configs, model options, env keys, and validation helpers (including `resolveOpenRouterMaxTokens`, `resolveOpenAiCompatibleUseResponsesApi`, `resolveOpenAiCompatibleStreaming`, `resolveMaxOutputTokens`, and `resolveStreamIdleTimeoutForProvider`).
+- `src/config/reasoning.ts` — reasoning-effort capability table and `resolveReasoningConfig()` that validates `OPENWIKI_REASONING_EFFORT` for supported OpenAI GPT-5.6 and NVIDIA NIM models.
+- `src/cli/input/menu.ts` — slash-command menu state, including `/effort` reasoning-effort rows derived from `getReasoningCapability()`.
 - `src/model-availability.ts` — `getSelectedModelAvailability()` validates the selected model against the OpenAI `/models` catalogue before inference; `unavailable` aborts, `unknown` proceeds.
 - `examples/openwiki-update.yml` — GitHub Actions scheduled automation example.
 - `examples/openwiki-update.gitlab-ci.yml` — GitLab CI scheduled automation example.
@@ -166,6 +173,7 @@ OpenWiki is a TypeScript CLI that writes and maintains documentation for a repos
 - `src/setup/credentials.tsx` (re-exports `src/setup/credentials/`)
 - `src/setup/onboarding.ts`
 - `src/config/constants.ts`
+- `src/config/reasoning.ts`
 - `src/auth/external-cli-auth.ts`
 - `src/platform/diagnostics.ts`
 - `src/platform/utils.ts`
