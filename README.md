@@ -51,6 +51,8 @@ Generate a wiki for the current repository. The first run walks you through pick
 openwiki --init
 ```
 
+Running `openwiki --init` again replaces the existing generated repository wiki and Claims with a brand-new generation. OpenWiki preserves the user-authored `openwiki/INSTRUCTIONS.md` brief and restores the previous wiki if generation fails or is cancelled.
+
 Keep it current automatically by adding a scheduled CI job that opens a docs PR whenever the wiki changes:
 
 - **GitHub Actions:** copy [`openwiki-update.yml`](./examples/openwiki-update.yml) into `.github/workflows/openwiki-update.yml`.
@@ -116,6 +118,16 @@ OpenWiki runs in one of two modes. Bare `openwiki`, `openwiki --init`, and `open
 | **Personal**         | Your connected sources | `~/.openwiki/wiki`      | `openwiki personal --init` |
 
 By default the CLI stays open after a run so you can send follow-up messages. Add `-p` / `--print` for a one-shot, non-interactive run that prints the final output and exits. `--init` and `--update` auto-exit on success in an interactive terminal, so the same command works one-shot or interactively.
+
+### Local state directory
+
+OpenWiki stores local credentials, the personal wiki, connector data, conversation history, and skills under `~/.openwiki` by default. Set `OPENWIKI_CONFIG_DIR` before starting OpenWiki to use a different writable directory, such as a mounted container volume:
+
+```sh
+OPENWIKI_CONFIG_DIR=/data/openwiki openwiki personal --init
+```
+
+The override selects a separate state directory; OpenWiki does not move or delete an existing `~/.openwiki` directory. Copy any state you want to preserve yourself, and point the variable at a dedicated directory because OpenWiki restricts its permissions for the current user.
 
 ## Explore your wiki
 
