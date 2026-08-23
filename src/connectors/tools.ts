@@ -319,7 +319,7 @@ function ingestFailureResult(
     message: `${connector.displayName} ingestion failed: ${message}`,
     rawFiles: [],
     runId: "",
-    statePath: `~/.openwiki/connectors/${connector.id}/state.json`,
+    statePath: `${openWikiConnectorsDisplayPath}/${connector.id}/state.json`,
     status: "error",
     warnings: [message],
   };
