@@ -1,18 +1,19 @@
 ---
 type: integration guide
-title: Coding-Agent Integrations (Codex/Claude/OpenCode)
+title: Coding-Agent Integrations (Codex/Claude/OpenCode/Cursor)
 description: How OpenWiki runs inside a host coding agent through the five-operation MCP page-job protocol, how install writes host config and the shared skill bundle, and the divided ownership between host research and OpenWiki finalization.
 tags: [integrations, mcp, coding-agents, installation, page-job, host]
-verified:
-  - by: openwiki/0.3.3
-    at: 2026-08-25T02:14:25.283Z
 sources:
   - id: openwiki-source-f317ee207e1653d2033c81a4
     resource: repo://CONTRIBUTING.md
   - id: openwiki-source-438fff4d79b8ab99f5c88c73
     resource: repo://integrations/openwiki/SKILL.md
+  - id: openwiki-source-638173446de4138fa3a622a8
+    resource: repo://src/claims/guidance.ts
   - id: openwiki-source-ada18c62d92003b613355e30
     resource: repo://src/cli/integrations.ts
+  - id: openwiki-source-1197594de038075f3570340c
+    resource: repo://src/generation/page-jobs.ts
   - id: openwiki-source-7c5ecb56558cc061dab24f9d
     resource: repo://src/generation/repository-run.ts
   - id: openwiki-source-5c32d5425e61a6c32d810844
@@ -43,16 +44,21 @@ sources:
     resource: repo://src/integrations/mcp/server.ts
   - id: openwiki-source-6f06cc988142430d18f2233e
     resource: repo://src/integrations/mcp/stdio.ts
-generated: { by: "openwiki/0.3.3", at: "2026-08-25T02:14:25.283Z" }
+  - id: openwiki-source-349c953869b025f9d4935470
+    resource: repo://src/platform/language.ts
+generated: { by: "openwiki/0.4.3", at: "2026-08-30T10:21:48.925Z" }
+verified:
+  - by: openwiki/0.4.3
+    at: 2026-08-30T10:21:48.925Z
 ---
 
-# Coding-Agent Integrations (Codex/Claude/OpenCode)
+# Coding-Agent Integrations (Codex/Claude/OpenCode/Cursor)
 
-OpenWiki can run _inside_ a host coding agent (Codex, Claude Code, or OpenCode)
-instead of as a standalone process. The host agent supplies the model, native
+OpenWiki can run _inside_ a host coding agent (Codex, Claude Code, OpenCode, or
+Cursor) instead of as a standalone process. The host agent supplies the model, native
 repository tools, and Markdown authoring; OpenWiki supplies a deterministic,
 resumable **page-job lifecycle** over the Model Context Protocol (MCP). The two
-sides communicate through exactly five MCP tools, and installation wires a local
+sides communicate through exactly six MCP tools, and installation wires a local
 stdio MCP server plus a shared skill bundle into each host's own configuration.
 
 This page documents the protocol operations, the divided ownership of research
@@ -76,29 +82,53 @@ page queue, Claims validation and reconciliation, indexes, provenance,
 finalization, and all managed setup files. This split is stated in the shared
 skill (`integrations/openwiki/SKILL.md`) and reinforced in the MCP server
 instructions advertised at initialization
-(`src/integrations/mcp/server.ts`).
+(`src/integrations/mcp/server.ts`), which embed the shared
+`CLAIMS_RECONCILIATION_GUIDANCE` from `src/claims/guidance.ts` so the sparse
+reconciliation rules reach the host model through the transport as well as the
+skill bundle.
 
-## The five MCP operations
+## The six MCP operations
 
-`HostSessionManager.tools()` exposes exactly five transport-neutral lifecycle
+`HostSessionManager.tools()` exposes exactly six transport-neutral lifecycle
 tools, in order: `openwiki_begin`, `openwiki_submit_plan`, `openwiki_next_page`,
-`openwiki_submit_page`, and `openwiki_finish`. Each tool parses its input against
-a strict Zod schema before delegating to the repository-generation core.
+`openwiki_inspect_page_claims`, `openwiki_submit_page`, and `openwiki_finish`.
+Each tool parses its input against a strict Zod schema before delegating to the
+repository-generation core. The `ProtocolToolName` type and `tools()` return
+value are the single source of truth for this set; both report "the six
+OpenWiki 0.5 lifecycle tools."
 
 - **`openwiki_begin`** — Starts or resumes a run for an absolute Git root in
-  mode `init` or `update`, with optional `language` and `force`. It resolves the
-  root, calls `beginRepositoryRun`, and either records the active run or returns
-  a proven update **no-op** (`status=noop`) without an active run. A clean update
-  returns no-op so the host reports "no update required" and stops.
+  mode `init` or `update`, with optional `language` and `force`. It validates the
+  optional `language` via `resolveLanguage` and rejects an unrecognized BCP-47
+  value with `invalid_input` before any run state is created, so a rejected
+  request leaves nothing to clean up and can simply be retried with a real code.
+  It then resolves the root, calls `beginRepositoryRun`, and either records the
+  active run or returns a proven update **no-op** (`status=noop`) without an
+  active run. A clean update returns no-op so the host reports "no update
+  required" and stops.
 - **`openwiki_submit_plan`** — Persists the run's final canonical page plan.
   `pages` may be empty (a valid update with no page work or only deletions), and
   `deletePages` is optional.
-- **`openwiki_next_page`** — Returns the first pending page job with its current
-  Claims, or `status=complete` when the queue is drained.
+- **`openwiki_next_page`** — Returns the first pending page job with its Claim
+  count and **only the stale or unresolved Claims requiring an explicit
+  decision**; current issue-free Claims are retained automatically and stay
+  compact. Returns `status=complete` when the queue is drained.
+- **`openwiki_inspect_page_claims`** — On-demand tool that returns the current
+  pending page's complete Claim set **without opaque evidence versions**, scoped
+  to the current pending job only (`jobId` must match the first pending page, or
+  the call fails with `invalid_state`). Focused updates normally need only the
+  issue Claims already returned by `openwiki_next_page`; this tool exists for the
+  case where the worker intentionally revises or removes otherwise-current
+  content whose Claim ids are not in the pending job.
 - **`openwiki_submit_page`** — Completes the active job after its Markdown is
-  written by submitting that page's complete intended Claim set (at least one
-  material, repository-grounded Claim). Structural `index.md` pages are
-  generated deterministically and never become jobs.
+  written. It takes a **sparse** payload — `confirmedClaimIds` for rechecked
+  issue Claims kept unchanged, `claims` for revised/new propositions, and
+  `retractedClaimIds` for removals — and retains every other current Claim
+  automatically. At least one material, repository-grounded Claim must remain
+  after reconciliation; structural `index.md` pages are generated
+  deterministically and never become jobs. If validation rejects the page or
+  payload, the worker corrects it and retries; completion requires one
+  successful submission.
 - **`openwiki_finish`** — Finalizes the run only after every job is complete:
   deletion, validation, indexing, provenance, Claims finalization, and metadata
   persistence, then clears process-local state.
@@ -116,8 +146,13 @@ sequenceDiagram
     loop until complete
         Host->>SM: openwiki_next_page
         SM->>Core: nextRepositoryPage
-        Core-->>Host: pending job OR complete
-        Host->>SM: openwiki_submit_page(jobId, claims)
+        Core-->>Host: pending job (issue Claims only) OR complete
+        opt revise otherwise-current content
+            Host->>SM: openwiki_inspect_page_claims(jobId)
+            SM->>Core: inspectRepositoryPageClaims
+            Core-->>Host: full Claim set (no evidence versions)
+        end
+        Host->>SM: openwiki_submit_page(jobId, sparse decisions)
         SM->>Core: submitRepositoryPage
     end
     Host->>SM: openwiki_finish
@@ -125,7 +160,9 @@ sequenceDiagram
     Core-->>Host: complete
 ```
 
-The MCP page-job lifecycle a host agent drives end to end.
+The MCP page-job lifecycle a host agent drives end to end. The inspect step is
+optional and used only before intentionally revising or removing
+otherwise-current page content.
 
 ## Session lifecycle and invariants
 
@@ -193,12 +230,18 @@ registry of supported hosts. Each entry declares its display name, provenance
 actor, per-scope skill directory and MCP config, and a documentation URL:
 
 - **Codex** — `.codex/config.toml` (`codex-toml`), skill under
-  `.agents/skills/openwiki`, at both user and project scope.
+  `.agents/skills/openwiki`, at both user and project scope; `producerActor`
+  `codex`.
 - **Claude Code** — user config `.claude.json` and project config `.mcp.json`
-  (both `json`), skill under `.claude/skills/openwiki`.
+  (both `json`), skill under `.claude/skills/openwiki`;
+  `producerActor` `claude-code`.
 - **OpenCode** — user config `.config/opencode/opencode.jsonc` and project config
   `opencode.jsonc` (both `opencode-json`), with distinct user/project skill
-  directories (`.config/opencode/...` vs `.opencode/...`).
+  directories (`.config/opencode/skills/openwiki` vs `.opencode/skills/openwiki`);
+  `producerActor` `opencode`.
+- **Cursor** — `.cursor/mcp.json` (`json`), skill under
+  `.cursor/skills/openwiki`, at both user and project scope;
+  `producerActor` `cursor`.
 
 `defaultMcpServerCommand(target)` produces the published invocation
 `openwiki mcp --host <target>`, which is what installed configs launch.
@@ -252,7 +295,7 @@ requested scope does not exist for the host.
 ## User-level vs project scope
 
 Every host supports **project** scope; user scope is optional (`user` may be
-`null` in the registry, though all three current hosts support both). For
+`null` in the registry, though all four current hosts support both). For
 **project** scope the installer resolves the root through the same
 `resolveRepositoryRoot` used by runs, so a project install always lands at the
 Git worktree root; for **user** scope it anchors at the home directory. When a
@@ -267,7 +310,11 @@ config adapter when possible (add a focused one only for a genuinely different
 format), and add focused registry/install/status/uninstall/config-conflict tests.
 The full procedure, including the local dogfooding command
 `pnpm integrations:dev <host>`, lives in `CONTRIBUTING.md` §"Adding a
-coding-agent integration".
+coding-agent integration". `pnpm integrations:dev` builds OpenWiki, refreshes
+the host skill, and records absolute paths to the current Node executable and
+`dist/cli/cli.js`; the four current hosts all install at user scope, and later
+source changes only require `pnpm build` unless the bundled skill itself
+changes.
 
 ## Focused tests
 

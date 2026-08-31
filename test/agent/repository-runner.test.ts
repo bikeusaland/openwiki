@@ -74,6 +74,8 @@ const harness = vi.hoisted(() => ({
   noop: false,
   pageSubmissionCalls: 0,
   pageToolResults: [] as unknown[],
+  pageWorkerFailures: 0,
+  pageWorkerPostSubmitFailures: 0,
   planSubmissionCalls: 0,
   planToolResults: [] as unknown[],
   planPaths: ["/openwiki/quickstart.md", "/openwiki/architecture.md"],
@@ -96,7 +98,12 @@ vi.mock("deepagents", async (importOriginal) => {
     },
     createDeepAgent(options: CapturedAgentOptions) {
       harness.agentOptions.push(options);
-      const completionTool = options.tools[0];
+      const completionTool = options.tools.find(({ name }) =>
+        ["submit_plan", "submit_page"].includes(name),
+      );
+      if (!completionTool) {
+        throw new Error("Expected one repository completion tool.");
+      }
       const toolName = completionTool.name;
       if (toolName !== "submit_plan" && toolName !== "submit_page") {
         throw new Error(`Unexpected completion tool: ${toolName}`);
@@ -194,6 +201,11 @@ vi.mock("deepagents", async (importOriginal) => {
               harness.planToolResults.push(rejection);
             }
 
+            if (toolName === "submit_page" && harness.pageWorkerFailures > 0) {
+              harness.pageWorkerFailures -= 1;
+              throw new Error("injected page worker failure");
+            }
+
             const input =
               toolName === "submit_plan"
                 ? {
@@ -218,6 +230,13 @@ vi.mock("deepagents", async (importOriginal) => {
               harness.workerExitsWithoutSubmit = false;
             } else {
               await completionTool.invoke(input);
+              if (
+                toolName === "submit_page" &&
+                harness.pageWorkerPostSubmitFailures > 0
+              ) {
+                harness.pageWorkerPostSubmitFailures -= 1;
+                throw new Error("injected post-submit worker failure");
+              }
             }
           },
         }),
@@ -282,6 +301,13 @@ vi.mock("../../src/generation/repository-run.js", () => ({
         resumed: harness.resumed || harness.beginCalls > 1,
         lastUpdate: null,
         changedPaths: [...harness.changedPaths],
+        pageUpdateWindows: [
+          {
+            pages: [],
+            changedPaths: [...harness.changedPaths],
+            fullReview: true,
+          },
+        ],
         claimIssues: [],
         completedPages:
           run.state.plan?.pages.filter(({ status }) => status === "complete")
@@ -330,7 +356,8 @@ vi.mock("../../src/generation/repository-run.js", () => ({
               ...job,
               mode: run.state.mode,
               existing: false,
-              existingClaims: [],
+              existingClaimCount: 0,
+              claimsRequiringAttention: [],
             },
           }
         : { status: "complete" },
@@ -402,6 +429,8 @@ beforeEach(() => {
   harness.noop = false;
   harness.pageSubmissionCalls = 0;
   harness.pageToolResults = [];
+  harness.pageWorkerFailures = 0;
+  harness.pageWorkerPostSubmitFailures = 0;
   harness.planSubmissionCalls = 0;
   harness.planToolResults = [];
   harness.planPaths = ["/openwiki/quickstart.md", "/openwiki/architecture.md"];
@@ -436,6 +465,10 @@ describe("runNativeRepositoryGeneration", () => {
     expect(String(harness.agentOptions[2]?.systemPrompt)).toContain(
       "You own exactly /openwiki/architecture.md",
     );
+    expect(harness.agentOptions[1]?.tools.map(({ name }) => name)).toEqual([
+      "inspect_claims",
+      "submit_page",
+    ]);
     expect(events).toContainEqual(
       expect.objectContaining({
         type: "repository_progress",
@@ -484,7 +517,7 @@ describe("runNativeRepositoryGeneration", () => {
       '"message":"Unsupported evidence resource: src/agent/index.ts"',
     );
     expect(rejection.text).toContain(
-      '"retry":"Correct the assigned page or complete Claim payload and call submit_page again."',
+      '"retry":"Correct the assigned page or sparse Claim decisions and call submit_page again."',
     );
     expect(harness.finishCalls).toBe(1);
   });
@@ -510,6 +543,29 @@ describe("runNativeRepositoryGeneration", () => {
     expect(rejection.text).toContain(
       '"retry":"Correct the plan and call submit_plan again."',
     );
+    expect(harness.finishCalls).toBe(1);
+  });
+
+  test("skips a failed page worker and continues the queue", async () => {
+    harness.pageWorkerFailures = 1;
+    harness.planPaths = ["/openwiki/failed.md", "/openwiki/later.md"];
+
+    await expect(runHarness()).resolves.toBeDefined();
+
+    expect(harness.restoreCalls).toBe(1);
+    expect(harness.currentRun?.state.plan?.pages[0]?.status).toBe("skipped");
+    expect(harness.currentRun?.state.plan?.pages[1]?.status).toBe("complete");
+    expect(harness.finishCalls).toBe(1);
+  });
+
+  test("keeps a durably completed page after a later worker failure", async () => {
+    harness.pageWorkerPostSubmitFailures = 1;
+    harness.planPaths = ["/openwiki/completed.md"];
+
+    await expect(runHarness()).resolves.toBeDefined();
+
+    expect(harness.restoreCalls).toBe(0);
+    expect(harness.currentRun?.state.plan?.pages[0]?.status).toBe("complete");
     expect(harness.finishCalls).toBe(1);
   });
 

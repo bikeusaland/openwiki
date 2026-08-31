@@ -12,6 +12,12 @@ sources:
     resource: repo://package.json
   - id: openwiki-source-23775c3de52f3ab95a13cb8b
     resource: repo://README.md
+  - id: openwiki-source-6cb3236b8c1412a26d832fcf
+    resource: repo://src/agent/repository-runner.ts
+  - id: openwiki-source-69abc6f0f641147820a274bc
+    resource: repo://src/agent/utils.ts
+  - id: openwiki-source-638173446de4138fa3a622a8
+    resource: repo://src/claims/guidance.ts
   - id: openwiki-source-5c43e3fe562cf274dd6a5564
     resource: repo://src/cli/cli.tsx
   - id: openwiki-source-3fc16f0371ced4d94330f06c
@@ -20,10 +26,14 @@ sources:
     resource: repo://src/generation/repository-run.ts
   - id: openwiki-source-080c4525024a9b689e361cbb
     resource: repo://src/generation/run-state.ts
-generated: { by: "openwiki/0.4.0", at: "2026-08-26T22:32:29.466Z" }
+  - id: openwiki-source-410e7efbe6dee8c4d43e9b4d
+    resource: repo://src/integrations/core/protocol.ts
+  - id: openwiki-source-349c953869b025f9d4935470
+    resource: repo://src/platform/language.ts
+generated: { by: "openwiki/0.4.3", at: "2026-08-30T10:21:48.925Z" }
 verified:
-  - by: openwiki/0.4.0
-    at: 2026-08-26T22:32:29.466Z
+  - by: openwiki/0.4.3
+    at: 2026-08-30T10:21:48.925Z
 ---
 
 # OpenWiki Quickstart
@@ -82,61 +92,65 @@ into a command, and dispatches:
 
 - `integrations` and `mcp` commands go to the host-integration surface
   (`runIntegrationsCommand` / `runMcpCommand`).
-- All other commands run through the native pipeline, which loads environment,
-  resolves the startup command, and then either prints a startup error, runs
-  non-interactively in print mode, or renders the interactive Ink `App`.
+- All other commands run through `runStandardCommand`, the native pipeline, which
+  loads environment, resolves the startup command, decides once whether this is
+  the first run (mints the install id), and then either prints a startup error,
+  runs non-interactively in print mode, or renders the interactive Ink `App`.
 
 The `dev` script points at this same `.tsx` file, so behavior is identical
 between `pnpm run dev` and the built binary.
 
+> **Behavioral change operators hit first:** an unrecognized `--language` value
+> (for example a misspelled locale or a bare language name) is now rejected at
+> parse time as a parse error rather than silently generating an English wiki.
+> `parseCommand` classifies the flag via `resolveLanguage` and, on an
+> `unrecognized` result, returns an `error` command with the user-facing
+> message before any run work or persisted state is touched. The full command
+> and flag reference lives in
+> [CLI Reference](/openwiki/operations/cli-reference.md).
+
 ## Task-routing map
 
-Find your task on the left, then read the page on the right.
+Find your task on the left, then read the page on the right. This routes you to
+the canonical wiki pages; each one links into the deeper source map.
 
 ### Understand the system
 
-| I want to…                                                                                                          | Read                                                                             |
-| ------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------- |
-| Get the top-level picture of how the CLI, agent, modes, resumable generation, and finalization fit together          | [Architecture Overview](/openwiki/architecture/overview.md)                      |
-| Understand how the DeepAgents documentation agent is built (models, backends, prompts, middleware)                  | [Agent Runtime, Models, and Middleware](/openwiki/architecture/agent-runtime.md) |
-| Find which subsystem lives where under `/src`                                                                        | [Source Map](/openwiki/architecture/source-map.md)                               |
+| I want to…                                                                                                          | Read                                                        |
+| ------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------- |
+| Get the top-level picture of how the CLI, agent, modes, resumable generation, Claims, finalization, connectors, and the visualizer fit together | [Architecture Overview](/openwiki/architecture/overview.md) |
+| Find which subsystem lives where under `/src`                                                                       | [Source Map](/openwiki/architecture/source-map.md)          |
 
 ### Learn the core concepts
 
-| I want to…                                                                       | Read                                                                     |
-| -------------------------------------------------------------------------------- | ------------------------------------------------------------------------ |
-| Understand the two operating modes and where each writes its state               | [Code vs Personal Modes](/openwiki/concepts/two-modes.md)                |
-| Understand grounded Claims: material facts tied to versioned repository evidence | [Grounded Claims](/openwiki/concepts/grounded-claims.md)                 |
-| See what OKF output looks like (frontmatter, provenance, validated Mermaid)      | [Open Knowledge Format Output](/openwiki/concepts/okf-output.md)         |
-| Choose a model provider and configure its credentials                            | [Model Providers and Credentials](/openwiki/concepts/model-providers.md) |
+| I want to…                                                                        | Read                                                                 |
+| --------------------------------------------------------------------------------- | -------------------------------------------------------------------- |
+| Understand grounded Claims: material facts tied to versioned repository evidence   | [Grounded Claims](/openwiki/concepts/grounded-claims.md)             |
+| See what OKF output looks like (frontmatter, provenance, validated Mermaid)        | [Open Knowledge Format Output](/openwiki/concepts/okf-output.md)     |
 
 ### Follow a workflow end to end
 
-| I want to…                                                                                                              | Read                                                                             |
-| ----------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------- |
-| Set up OpenWiki for the first time (provider/model, credentials, repo setup)                                            | [Onboarding and Setup](/openwiki/workflows/onboarding.md)                        |
-| Trace the resumable page-job generation flow (`begin → submit_plan → next_page → submit_page → finish`)                  | [Repository Generation Lifecycle](/openwiki/workflows/repository-generation.md)  |
-| Understand how a failing or early-exiting page worker is skipped and restored without losing completed pages            | [Repository Generation Lifecycle](/openwiki/workflows/repository-generation.md)  |
-| Understand how Claims are reconciled on update and how a page submits its full Claim set                                | [Claims Reconciliation on Update](/openwiki/workflows/claims-reconciliation.md)  |
-| Understand deterministic finalization, index/provenance sync, link validation, and skipped-page handling on finish      | [Wiki Finalization and Link Integrity](/openwiki/workflows/wiki-finalization.md) |
-| Trace how personal-mode ingestion pulls connector sources and updates the brain                                          | [Personal Mode Ingestion](/openwiki/workflows/personal-ingestion.md)             |
+| I want to…                                                                                                              | Read                                                                  |
+| ----------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------- |
+| Set up OpenWiki for the first time (provider/model, credentials, repo setup)                                            | [First-Run Onboarding](/openwiki/workflows/onboarding.md)             |
+| Trace the resumable page-job generation flow (`begin → submit_plan → next_page → submit_page → finish`, with on-demand `inspect_page_claims`)                  | [Repository Generation Workflow](/openwiki/workflows/repository-generation.md) |
+| Understand how a failing or early-exiting page worker is skipped and restored without losing completed pages            | [Repository Generation Workflow](/openwiki/workflows/repository-generation.md) |
+| Understand how repository source drift during a run is detected and why the run finalizes without advancing the source checkpoint | [Repository Generation Workflow](/openwiki/workflows/repository-generation.md) |
+| Understand how Claims are reconciled on update and how a page submits sparse Claim decisions (`confirmedClaimIds` / `claims` / `retractedClaimIds`) with issue-free Claims retained automatically and full Claims available via on-demand inspect | [Claims Reconciliation](/openwiki/workflows/claims-reconciliation.md) |
+| Understand deterministic finalize-once finalization, index/provenance sync, link validation, and skipped-page restore on finish | [Wiki Finalization Workflow](/openwiki/workflows/wiki-finalization.md) |
 
 ### Operate and configure it
 
-| I want to…                                                                                   | Read                                                                   |
-| -------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------- |
-| Look up CLI commands and flags (init/update, mode, print, integrations, visualize, schedule) | [CLI Commands and Flags](/openwiki/operations/cli-reference.md)        |
-| Configure environment variables and the local state directory                                | [Configuration and Environment](/openwiki/operations/configuration.md) |
+| I want to…                                                                                   | Read                                                         |
+| -------------------------------------------------------------------------------------------- | ------------------------------------------------------------ |
+| Look up CLI commands and flags (init/update, mode, print, integrations, visualize, schedule) | [CLI Reference](/openwiki/operations/cli-reference.md)        |
 | Set up scheduled self-update in CI and the docs-PR workflow                                  | [CI Scheduling and Self-Update](/openwiki/operations/ci-scheduling.md) |
-| Understand opt-out telemetry and diagnostics                                                 | [Telemetry and Diagnostics](/openwiki/operations/telemetry.md)         |
 
 ### Integrate with other tools
 
-| I want to…                                                                                                        | Read                                                                                         |
-| ----------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------- |
-| Run OpenWiki inside Codex, Claude Code, or OpenCode                                                               | [Coding-Agent Integrations (Codex/Claude/OpenCode)](/openwiki/integrations/coding-agents.md) |
-| Use or add a source connector (Custom MCP, Notion, Slack, Gmail, X, Web Search, Hacker News, LangSmith, git-repo) | [Source Connectors](/openwiki/integrations/connectors.md)                                    |
-| Publish or explore the wiki as an interactive graph                                                               | [Interactive Visualizer](/openwiki/integrations/visualizer.md)                               |
+| I want to…                                                                  | Read                                             |
+| --------------------------------------------------------------------------- | ------------------------------------------------ |
+| Run OpenWiki inside Codex, Claude Code, OpenCode, or Cursor                 | [Coding-Agent Integrations](/openwiki/integrations/coding-agents.md) |
 
 ### Test your changes
 
@@ -154,12 +168,48 @@ Find your task on the left, then read the page on the right.
   `OPENWIKI_CONFIG_DIR` to relocate to a different writable directory.
 
 Repository (code) generation follows the resumable page-job flow
-`begin → submit_plan → next_page → submit_page → … → finish`. Each page job has
+`begin → submit_plan → next_page → submit_page → … → finish`, with the
+non-mutating `inspect_page_claims` available on demand inside `generating` for a
+worker that needs the complete current Claim set before intentionally revising
+or removing otherwise-current content. Each page job has
 a `PageJobStatus` of `pending`, `skipped`, or `complete`. A worker that fails or
 exits without submitting its page is marked `skipped` and rolled back to its
 pre-worker state so completed pages are not lost; the run can still `finish` once
-every remaining job is `complete` or `skipped`, and a later run re-attempts the
-skipped pages. In-progress runs are recorded in `openwiki/.run.json`; on a
-persistent checkout, an interrupted `openwiki --init` resumes the durable page
-queue by rerunning the same command, while ephemeral CI runners start fresh
-after failure unless their workspace is preserved.
+every remaining job is `complete` or `skipped`, and a resumed run resets skipped
+jobs back to `pending` so they are re-attempted. In-progress runs are recorded in
+`openwiki/.run.json`; on a persistent checkout, an interrupted run resumes the
+durable page queue, while ephemeral CI runners start fresh after failure unless
+their workspace is preserved. An update whose Claims preflight is clean, source
+fingerprint is unchanged, and every existing page has complete baseline coverage
+is proven a strict no-op at `begin` time and skips model invocation.
+
+Finalization is deterministic and runs once. `finishRepositoryRun` refuses to
+finish while any page job is still `pending`, validates that every `skipped` job
+carries its original page snapshot, restores skipped pages to their pre-worker
+Markdown and Claims, persists and proves the reconciled Claims durable, and only
+then removes `openwiki/.run.json` — so any earlier failure leaves the run
+resumable. If repository source changed while OpenWiki was running (detected by
+re-fingerprinting the source before and after finalization), the run finalizes
+without advancing the source checkpoint and writes `interrupted` update metadata
+instead of `complete`, prompting a follow-up `openwiki --update` to reconcile the
+drift.
+
+## Host-driven generation
+
+OpenWiki can also run inside a host coding agent (Codex, Claude Code, OpenCode,
+or Cursor) instead of launching its own model. The integration shares one
+canonical skill and the same six MCP operations as native generation:
+`openwiki_begin`, `openwiki_submit_plan`, `openwiki_next_page`, optional on-demand
+`openwiki_inspect_page_claims`, `openwiki_submit_page`, and `openwiki_finish`. The
+host owns repository research, planning, and factual authoring; OpenWiki owns the
+durable queue, Claims reconciliation, source-drift handling, and deterministic
+finalization. Host-driven runs currently support repository code wikis (not
+personal brains), use the host's authenticated model session, and use repository
+source and tests only — connector context (including LangSmith) is not yet
+supported. The host submits only sparse Claim decisions for each page
+(`confirmedClaimIds` for rechecked issue Claims kept unchanged, `claims` for
+revisions and additions, `retractedClaimIds` for removals); OpenWiki
+automatically retains current issue-free Claims and makes the full Claim set
+available through on-demand `openwiki_inspect_page_claims` for broad rewrites.
+See [Coding-Agent Integrations](/openwiki/integrations/coding-agents.md) for
+install scope, the host registry, and the host-driven lifecycle boundary.
