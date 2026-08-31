@@ -5,7 +5,7 @@ import type { RunContext } from "../agent/types.js";
 import type { UpdateNoopStatus } from "../agent/utils.js";
 import {
   createOpenWikiContentSnapshot,
-  createRepositorySourceFingerprint,
+  createRepositorySourceSnapshot,
   createRunContext,
   getRepositoryChangedPaths,
   getUpdateNoopStatus,
@@ -40,14 +40,23 @@ import {
 } from "../okf/index-labels.js";
 import {
   getPrimaryLanguageSubtag,
+  requireResolvedLanguage,
   resolveLanguage,
 } from "../platform/language.js";
 import { isFileNotFoundError } from "../platform/fs-errors.js";
 import { RepositoryRunError } from "./errors.js";
 import {
+  getCurrentRepositoryPageCompletion,
+  readRepositoryPageManifest,
+  recordRepositoryPageCompletion,
+  replaceRepositoryPageManifest,
+  seedRepositoryPageManifest,
+  type RepositorySourceCheckpoint,
+} from "./page-manifest.js";
+import {
   createRepositoryPlan,
-  replacePageClaims,
-  type ProposedPageClaim,
+  reconcilePageClaims,
+  type ProposedPageClaimReconciliation,
   type ProposedRepositoryPlan,
 } from "./page-jobs.js";
 import {
@@ -90,7 +99,7 @@ export interface BeginRepositoryRunInput {
   planningContext?: string;
 
   /**
-   * Stable producer and metadata identities for the run.
+   * Producer and metadata identities for the current session.
    */
   actor: RepositoryRunActor;
 
@@ -128,6 +137,33 @@ export interface ActiveRepositoryRun {
    * Strict process-local Claims runtime rebuilt from durable state.
    */
   claimsRuntime: ClaimsRuntime;
+}
+
+/**
+ * Pages sharing one committed source baseline and changed-path window.
+ */
+export interface RepositoryPageUpdateWindow {
+  /**
+   * Last committed Git HEAD through which these pages are known correct.
+   *
+   * @default undefined when no trustworthy baseline exists.
+   */
+  baseGitHead?: string;
+
+  /**
+   * Canonical pages that share this baseline.
+   */
+  pages: string[];
+
+  /**
+   * Visible repository paths changed after the shared baseline.
+   */
+  changedPaths: string[];
+
+  /**
+   * Whether the planner must review without a bounded historical baseline.
+   */
+  fullReview: boolean;
 }
 
 /**
@@ -200,6 +236,11 @@ export interface ActiveBeginView {
   changedPaths: string[];
 
   /**
+   * Existing factual pages grouped by their committed update baseline.
+   */
+  pageUpdateWindows: RepositoryPageUpdateWindow[];
+
+  /**
    * Stable Claims preflight issues supplied to planning.
    */
   claimIssues: readonly GroundingIssue[];
@@ -252,6 +293,21 @@ export type BeginRepositoryRunResult =
   { view: ActiveBeginView; run: ActiveRepositoryRun } | { view: NoopBeginView };
 
 /**
+ * Projects the active run's immutable source identity into page coverage.
+ *
+ * @param state - Durable active repository run state.
+ * @returns Source checkpoint shared by every page in the current plan.
+ */
+export function getRepositoryRunSourceCheckpoint(
+  state: RepositoryRunState,
+): RepositorySourceCheckpoint {
+  return {
+    sourceFingerprint: state.sourceFingerprint,
+    ...(state.targetGitHead ? { gitHead: state.targetGitHead } : {}),
+  };
+}
+
+/**
  * Starts a fresh durable run or reconstructs an interrupted run.
  *
  * Fresh init releases its rollback backup only after run state and interrupted
@@ -264,6 +320,17 @@ export async function beginRepositoryRun(
   input: BeginRepositoryRunInput,
 ): Promise<BeginRepositoryRunResult> {
   const now = input.now ?? (() => new Date());
+  // Reject an unrecognized language before touching the repository. Falling
+  // back to English here would persist the wrong language in run state, and
+  // resume refuses to change a started run's language, so the caller could not
+  // correct the typo without deleting OpenWiki's own state files.
+  const resolvedRequest = resolveLanguage(input.language);
+  if (resolvedRequest.kind === "unrecognized") {
+    throw new RepositoryRunError("invalid_input", resolvedRequest.message);
+  }
+  const requestedLanguage =
+    resolvedRequest.kind === "resolved" ? resolvedRequest.language : undefined;
+
   await ensureCodeModeRepoSetup(input.root, {
     createWorkflow: input.mode === "init",
   });
@@ -279,7 +346,6 @@ export async function beginRepositoryRun(
     input.language,
   );
   const language = context.language ?? "en";
-  const requestedLanguage = resolveLanguage(input.language).language;
   const languageChanged =
     requestedLanguage !== undefined &&
     getPrimaryLanguageSubtag(requestedLanguage) !==
@@ -307,6 +373,39 @@ export async function beginRepositoryRun(
       throw new Error("Repository Claims runtime was not prepared.");
     }
 
+    const claimsStore = new ClaimsStore(input.root);
+    const initialPages = await claimsStore.discoverPages();
+    const source = await createRepositorySourceSnapshot(input.root, ignore);
+    if (
+      input.mode === "update" &&
+      context.lastUpdate?.gitHead &&
+      context.lastUpdate.status === "complete"
+    ) {
+      await seedRepositoryPageManifest(
+        input.root,
+        initialPages,
+        context.lastUpdate.gitHead,
+      );
+    }
+    if (input.mode === "update") {
+      await fastForwardUnchangedRepositoryPageCoverage(
+        input.root,
+        ignore,
+        initialPages,
+        {
+          sourceFingerprint: source.fingerprint,
+          ...(source.gitHead ? { gitHead: source.gitHead } : {}),
+        },
+      );
+    }
+    const seededManifest =
+      input.mode === "update"
+        ? await readRepositoryPageManifest(input.root)
+        : undefined;
+    const hasCompleteBaselineCoverage =
+      input.mode !== "update" ||
+      initialPages.every((page) => seededManifest?.pages[page] !== undefined);
+
     // Claims validation precedes update no-op detection. A clean Git status
     // cannot hide stale or unresolved grounding state.
     if (input.mode === "update" && input.force !== true) {
@@ -315,30 +414,49 @@ export async function beginRepositoryRun(
         ignore,
         input.language,
       );
-      if (preflight.shouldSkip && claimsRuntime.issueCount === 0) {
+      if (
+        preflight.shouldSkip &&
+        claimsRuntime.issueCount === 0 &&
+        hasCompleteBaselineCoverage
+      ) {
+        const source = await createRepositorySourceSnapshot(input.root, ignore);
         await claimsRuntime.finalize(now().toISOString());
-        await writeLastUpdateMetadata(
-          "update",
+        const stableSource = await createRepositorySourceSnapshot(
           input.root,
-          preflight.model,
-          "repository",
-          "complete",
-          preflight.language,
+          ignore,
         );
-        return {
-          view: {
-            status: "noop",
-            root: input.root,
-            mode: "update",
-            language,
-            updatePreflight: preflight,
-          },
-        };
+        if (stableSource.fingerprint === source.fingerprint) {
+          await replaceRepositoryPageManifest(input.root, initialPages, {
+            sourceFingerprint: source.fingerprint,
+            ...(source.gitHead ? { gitHead: source.gitHead } : {}),
+          });
+          const publishedSource = await createRepositorySourceSnapshot(
+            input.root,
+            ignore,
+          );
+          if (publishedSource.fingerprint === source.fingerprint) {
+            await writeLastUpdateMetadata(
+              "update",
+              input.root,
+              preflight.model,
+              "repository",
+              "complete",
+              preflight.language,
+            );
+            return {
+              view: {
+                status: "noop",
+                root: input.root,
+                mode: "update",
+                language,
+                updatePreflight: preflight,
+              },
+            };
+          }
+        }
       }
     }
 
-    const claimsStore = new ClaimsStore(input.root);
-    const initialPages = await claimsStore.discoverPages();
     const beforeContentSnapshot = await createOpenWikiContentSnapshot(
       input.root,
       "repository",
@@ -350,10 +468,6 @@ export async function beginRepositoryRun(
     });
     const requiredRewritePages =
       input.mode === "update" && languageChanged ? initialPages : [];
-    const sourceFingerprint = await createRepositorySourceFingerprint(
-      input.root,
-      ignore,
-    );
 
     const state: RepositoryRunState = {
       schemaVersion: 1,
@@ -365,7 +479,8 @@ export async function beginRepositoryRun(
       languageChanged,
       requiredRewritePages,
       initialPages,
-      sourceFingerprint,
+      sourceFingerprint: source.fingerprint,
+      ...(source.gitHead ? { targetGitHead: source.gitHead } : {}),
       ...(input.planningContext
         ? { planningContext: input.planningContext }
         : {}),
@@ -429,6 +544,17 @@ export async function beginRepositoryRun(
 }
 
 /**
+ * True when a backend result error indicates a file does not exist.
+ *
+ * Matches both the standard `"file_not_found"` error code used by some backends
+ * and the human-readable `"Error: File '...' not found"` string returned by
+ * DeepAgents' filesystem backends (see #765).
+ */
+function isNotFoundBackendError(error: string): boolean {
+  return error === "file_not_found" || error.includes("not found");
+}
+
+/**
  * Reconstructs a durable run and invalidates its complete plan on source drift.
  *
  * @param input - Current begin request used to validate the durable owner.
@@ -447,7 +573,7 @@ async function resumeRepositoryRun(
     );
   }
 
-  const requestedLanguage = resolveLanguage(input.language).language;
+  const requestedLanguage = requireResolvedLanguage(input.language);
   if (requestedLanguage && requestedLanguage !== state.language) {
     throw new RepositoryRunError(
       "conflict",
@@ -455,27 +581,17 @@ async function resumeRepositoryRun(
     );
   }
 
-  if (state.actor.producerActor !== input.actor.producerActor) {
-    throw new RepositoryRunError(
-      "conflict",
-      `Interrupted OpenWiki run is owned by producer ${state.actor.producerActor}; refusing to resume it as ${input.actor.producerActor}.`,
-    );
-  }
-
   const ignore = await OpenWikiIgnore.load(input.root);
-  const currentFingerprint = await createRepositorySourceFingerprint(
+  const currentSource = await createRepositorySourceSnapshot(
     input.root,
     ignore,
   );
-  const sourceChanged = currentFingerprint !== state.sourceFingerprint;
+  const sourceChanged = currentSource.fingerprint !== state.sourceFingerprint;
   const resetSkippedPages =
     state.plan?.pages.some(({ status }) => status === "skipped") ?? false;
-  const nextState: RepositoryRunState = {
+  let nextState: RepositoryRunState = {
     ...state,
-    actor: {
-      ...state.actor,
-      metadataModel: input.actor.metadataModel,
-    },
+    actor: { ...input.actor },
     ...(state.plan && resetSkippedPages
       ? {
           plan: {
@@ -491,8 +607,22 @@ async function resumeRepositoryRun(
   };
   if (sourceChanged) {
     nextState.phase = "planning";
-    nextState.sourceFingerprint = currentFingerprint;
+    nextState.sourceFingerprint = currentSource.fingerprint;
+    if (currentSource.gitHead) {
+      nextState.targetGitHead = currentSource.gitHead;
+    } else {
+      delete nextState.targetGitHead;
+    }
     delete nextState.plan;
+  } else {
+    if (!nextState.targetGitHead && currentSource.gitHead) {
+      nextState.targetGitHead = currentSource.gitHead;
+    }
+    nextState = await reconcileManifestPageJobs(
+      input.root,
+      nextState,
+      state.actor.producerActor,
+    );
   }
   // A finish-time drift check already stores the replacement fingerprint, so
   // the next begin may see sourceChanged=false. Plan absence is the durable
@@ -500,12 +630,7 @@ async function resumeRepositoryRun(
   if (!nextState.plan && input.planningContext) {
     nextState.planningContext = input.planningContext;
   }
-  if (
-    sourceChanged ||
-    resetSkippedPages ||
-    state.actor.metadataModel !== input.actor.metadataModel ||
-    nextState.planningContext !== state.planningContext
-  ) {
+  if (JSON.stringify(nextState) !== JSON.stringify(state)) {
     await writeRepositoryRunState(input.root, nextState);
     activeState = nextState;
   }
@@ -534,6 +659,77 @@ async function resumeRepositoryRun(
     run,
     view: await toActiveBeginView(run, true),
   };
+}
+
+/**
+ * Reconciles the transient queue with authoritative completed-page coverage.
+ *
+ * @param root - Absolute repository root.
+ * @param state - Durable run state for the unchanged active source.
+ * @param legacyCompletedBy - Producer used for legacy completed jobs.
+ * @returns State with manifest-proven pending jobs promoted to complete.
+ * @throws RepositoryRunError when a completed job cannot re-prove durable state.
+ */
+async function reconcileManifestPageJobs(
+  root: string,
+  state: RepositoryRunState,
+  legacyCompletedBy: string,
+): Promise<RepositoryRunState> {
+  if (!state.plan) return state;
+  const source = getRepositoryRunSourceCheckpoint(state);
+  let changed = false;
+  const pages: PageJob[] = [];
+  for (const page of state.plan.pages) {
+    let current = await getCurrentRepositoryPageCompletion(
+      root,
+      page.path,
+      source,
+    );
+    if (page.status === "complete" && !current) {
+      // Deterministic finish may rewrite a completed page and its sidecar before
+      // a later failure leaves `.run.json` in place. Re-prove those exact bytes
+      // instead of rejecting a safely resumable finish. Unpaired edits still
+      // fail closed inside recordRepositoryPageCompletion.
+      current = await recordRepositoryPageCompletion(
+        root,
+        page.path,
+        source,
+        page.completedBy ?? legacyCompletedBy,
+        state.runId,
+      );
+    }
+    if (
+      page.status === "complete" &&
+      current &&
+      (!current.completedBy || current.completedRunId !== state.runId)
+    ) {
+      current = await recordRepositoryPageCompletion(
+        root,
+        page.path,
+        source,
+        page.completedBy ?? legacyCompletedBy,
+        state.runId,
+      );
+    }
+    if (page.status === "pending" && current?.completedRunId === state.runId) {
+      pages.push({
+        ...page,
+        status: "complete" as const,
+        completedBy: current.completedBy ?? legacyCompletedBy,
+      });
+      changed = true;
+    } else if (page.status === "complete" && !page.completedBy) {
+      pages.push({
+        ...page,
+        completedBy: current?.completedBy ?? legacyCompletedBy,
+      });
+      changed = true;
+    } else {
+      pages.push(page);
+    }
+  }
+  if (!changed) return state;
+  return { ...state, plan: { ...state.plan, pages } };
 }
 
 /**
@@ -570,6 +766,17 @@ async function toActiveBeginView(
   resumed: boolean,
 ): Promise<ActiveBeginView> {
   const pages = run.state.plan?.pages ?? [];
+  const pageUpdateWindows =
+    run.state.mode === "update"
+      ? await getRepositoryPageUpdateWindows(
+          run.root,
+          run.ignore,
+          run.state.initialPages,
+        )
+      : [];
+  const changedPaths = [
+    ...new Set(pageUpdateWindows.flatMap((window) => window.changedPaths)),
+  ].sort(compareCodeUnits);
   return {
     status: "active",
     runId: run.state.runId,
@@ -581,18 +788,89 @@ async function toActiveBeginView(
     resumed,
     lastUpdate: run.state.previousLastUpdate,
     ...(run.state.wikiGoal ? { wikiGoal: run.state.wikiGoal } : {}),
-    changedPaths:
-      run.state.mode === "update"
-        ? await getRepositoryChangedPaths(
-            run.root,
-            run.ignore,
-            run.state.baseGitHead,
-          )
-        : [],
+    changedPaths,
+    pageUpdateWindows,
     claimIssues: run.claimsRuntime.issues,
     completedPages: pages.filter(({ status }) => status === "complete").length,
     ...(run.state.plan ? { totalPages: pages.length } : {}),
   };
+}
+
+/**
+ * Groups existing pages by their committed Git baseline for update planning.
+ *
+ * @param root - Absolute repository root.
+ * @param ignore - Active repository read boundary.
+ * @param pages - Factual pages present when the run began.
+ * @returns Stable baseline cohorts with their visible changed paths.
+ */
+async function getRepositoryPageUpdateWindows(
+  root: string,
+  ignore: OpenWikiIgnore,
+  pages: readonly string[],
+): Promise<RepositoryPageUpdateWindow[]> {
+  const manifest = await readRepositoryPageManifest(root);
+  const pagesByBaseline = new Map<string, string[]>();
+  for (const page of pages) {
+    const baseline = manifest.pages[page]?.gitHead ?? "";
+    const group = pagesByBaseline.get(baseline) ?? [];
+    group.push(page);
+    pagesByBaseline.set(baseline, group);
+  }
+
+  const windows: RepositoryPageUpdateWindow[] = [];
+  const baselines = [...pagesByBaseline.keys()].sort(compareCodeUnits);
+  for (const baseline of baselines) {
+    windows.push({
+      ...(baseline ? { baseGitHead: baseline } : {}),
+      pages: [...(pagesByBaseline.get(baseline) ?? [])].sort(compareCodeUnits),
+      changedPaths: await getRepositoryChangedPaths(
+        root,
+        ignore,
+        baseline || undefined,
+      ),
+      fullReview: baseline.length === 0,
+    });
+  }
+  return windows;
+}
+
+/**
+ * Advances page coverage across commits that changed only generated wiki files.
+ *
+ * @param root - Absolute repository root.
+ * @param ignore - Active repository read boundary.
+ * @param pages - Factual pages present when the run began.
+ * @param source - Current source checkpoint to fast-forward to.
+ */
+async function fastForwardUnchangedRepositoryPageCoverage(
+  root: string,
+  ignore: OpenWikiIgnore,
+  pages: readonly string[],
+  source: RepositorySourceCheckpoint,
+): Promise<void> {
+  if (!source.gitHead) return;
+
+  const manifest = await readRepositoryPageManifest(root);
+  for (const page of [...pages].sort(compareCodeUnits)) {
+    const entry = manifest.pages[page];
+    if (!entry?.gitHead || entry.gitHead === source.gitHead) continue;
+
+    const changedPaths = await getRepositoryChangedPaths(
+      root,
+      ignore,
+      entry.gitHead,
+    );
+    if (changedPaths.length > 0) continue;
+
+    await recordRepositoryPageCompletion(
+      root,
+      page,
+      source,
+      entry.completedBy,
+      entry.completedRunId,
+    );
+  }
 }
 
 /**
@@ -683,7 +961,8 @@ export type NextRepositoryPageResult =
       job: PageJob & {
         mode: RepositoryRunMode;
         existing: boolean;
-        existingClaims: InspectedClaim[];
+        existingClaimCount: number;
+        claimsRequiringAttention: InspectedClaim[];
       };
     }
   | { status: "complete" };
@@ -716,14 +995,46 @@ export async function nextRepositoryPage(
     if (!isFileNotFoundError(error)) throw error;
   }
 
+  const existingClaims = run.claimsRuntime.session.inspectClaims(job.path);
   return {
     status: "pending",
     job: {
       ...job,
       mode: run.state.mode,
       existing,
-      existingClaims: run.claimsRuntime.session.inspectClaims(job.path),
+      existingClaimCount: existingClaims.length,
+      claimsRequiringAttention: existingClaims.filter(({ issue }) => issue),
     },
+  };
+}
+
+/**
+ * Returns the complete compact Claim set for the current pending page on demand.
+ *
+ * Normal focused updates do not need this payload: current issue-free Claims
+ * are retained deterministically. Workers use this only when they intentionally
+ * revise or remove otherwise-current page content and need the owning Claim ids.
+ *
+ * @param run - Active run with a durably installed plan.
+ * @param jobId - Current pending page job identifier.
+ * @returns Complete model-facing Claims without opaque evidence versions.
+ */
+export function inspectRepositoryPageClaims(
+  run: ActiveRepositoryRun,
+  jobId: string,
+): { page: string; claims: InspectedClaim[] } {
+  const current = run.state.plan?.pages.find(
+    ({ status }) => status === "pending",
+  );
+  if (!current || current.id !== jobId) {
+    throw new RepositoryRunError(
+      "invalid_state",
+      "Only the current pending OpenWiki page job's Claims may be inspected.",
+    );
+  }
+  return {
+    page: current.path,
+    claims: run.claimsRuntime.session.inspectClaims(current.path),
   };
 }
 
@@ -747,7 +1058,7 @@ export async function captureRepositoryPageSnapshot(
   let markdown: string | null = null;
   try {
     const read = await run.backend.readRaw(current.path);
-    if (read.error && read.error !== "file_not_found") {
+    if (read.error && !isNotFoundBackendError(read.error)) {
       throw new RepositoryRunError(
         "invalid_state",
         `Could not snapshot ${current.path}: ${read.error}`,
@@ -851,7 +1162,7 @@ async function restoreRepositoryPageMarkdown(
       : await run.backend.write(snapshot.path, snapshot.markdown);
   if (
     result.error &&
-    !(snapshot.markdown === null && result.error === "file_not_found")
+    !(snapshot.markdown === null && isNotFoundBackendError(result.error))
   ) {
     throw new RepositoryRunError(
       "invalid_state",
@@ -871,10 +1182,7 @@ async function restoreRepositoryPageMarkdown(
  */
 export async function submitRepositoryPage(
   run: ActiveRepositoryRun,
-  input: {
-    jobId: string;
-    claims: ProposedPageClaim[];
-  },
+  input: { jobId: string } & ProposedPageClaimReconciliation,
 ): Promise<{ status: "complete"; page: string; remaining: number }> {
   const plan = run.state.plan;
   if (!plan || run.state.phase !== "generating") {
@@ -940,11 +1248,7 @@ export async function submitRepositoryPage(
   }
 
   try {
-    await replacePageClaims(
-      run.claimsRuntime.session,
-      current.path,
-      input.claims,
-    );
+    await reconcilePageClaims(run.claimsRuntime.session, current.path, input);
     // Persist the page's dirty Claim state before recording job completion.
     // Prove this page is durable before advancing the queue; the strict
     // whole-run proof waits until every PageJob is complete.
@@ -958,10 +1262,24 @@ export async function submitRepositoryPage(
     );
   }
 
+  await recordRepositoryPageCompletion(
+    run.root,
+    current.path,
+    getRepositoryRunSourceCheckpoint(run.state),
+    run.state.actor.producerActor,
+    run.state.runId,
+  );
+
   const nextPlan = {
     ...plan,
     pages: plan.pages.map((page) =>
-      page.id === current.id ? { ...page, status: "complete" as const } : page,
+      page.id === current.id
+        ? {
+            ...page,
+            status: "complete" as const,
+            completedBy: run.state.actor.producerActor,
+          }
+        : page,
     ),
   };
   const nextState: RepositoryRunState = {
@@ -1201,6 +1519,14 @@ export async function finishRepositoryRun(
   }
   const skippedPages = new Set(skippedJobs.map(({ path }) => path));
   const sourceChangedBeforeFinish = await hasRepositorySourceChanged(run);
+  const producerActorsByPage = new Map<string, string>();
+  for (const [page, entry] of Object.entries(
+    (await readRepositoryPageManifest(run.root)).pages,
+  )) {
+    if (entry.completedBy && entry.completedRunId === run.state.runId) {
+      producerActorsByPage.set(page, entry.completedBy);
+    }
+  }
 
   await applyAbandonedGeneratedPageDeletions(run, plan);
   await applyPlannedDeletions(run, plan.deletePages);
@@ -1214,6 +1540,7 @@ export async function finishRepositoryRun(
     prepared: deserializePreparedWikiState(run.state.preparedWiki),
     at: run.state.startedAt,
     producerActor: run.state.actor.producerActor,
+    producerActorsByPage,
     claimSources: run.claimsRuntime.session.getEvidenceResourcesByPage(),
   });
 
@@ -1223,6 +1550,13 @@ export async function finishRepositoryRun(
 
   await run.claimsRuntime.finalize(run.state.startedAt, skippedPages);
   await assertRepositoryClaimsDurable(run, skippedPages);
+  const store = new ClaimsStore(run.root);
+  await replaceRepositoryPageManifest(
+    run.root,
+    await store.discoverPages(),
+    getRepositoryRunSourceCheckpoint(run.state),
+    skippedPages,
+  );
   const sourceChanged =
     sourceChangedBeforeFinish || (await hasRepositorySourceChanged(run));
   if (skippedPages.size > 0 || sourceChanged) {
@@ -1264,8 +1598,8 @@ export async function finishRepositoryRun(
 async function hasRepositorySourceChanged(
   run: ActiveRepositoryRun,
 ): Promise<boolean> {
-  const current = await createRepositorySourceFingerprint(run.root, run.ignore);
-  return current !== run.state.sourceFingerprint;
+  const current = await createRepositorySourceSnapshot(run.root, run.ignore);
+  return current.fingerprint !== run.state.sourceFingerprint;
 }
 
 /**
@@ -1284,7 +1618,7 @@ async function applyAbandonedGeneratedPageDeletions(
   for (const page of await store.discoverPages()) {
     if (initial.has(page) || planned.has(page)) continue;
     const result = await run.backend.delete(page);
-    if (result.error && result.error !== "file_not_found") {
+    if (result.error && !isNotFoundBackendError(result.error)) {
       throw new RepositoryRunError(
         "invalid_state",
         `Could not remove page abandoned by an invalidated plan ${page}: ${result.error}`,
@@ -1306,7 +1640,7 @@ async function applyPlannedDeletions(
 ): Promise<void> {
   for (const page of pages) {
     const result = await run.backend.delete(page);
-    if (result.error && result.error !== "file_not_found") {
+    if (result.error && !isNotFoundBackendError(result.error)) {
       throw new RepositoryRunError(
         "invalid_state",
         `Could not delete planned OpenWiki page ${page}: ${result.error}`,
