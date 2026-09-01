@@ -179,6 +179,11 @@ async function ingest(
     }
   }
 
+  // Nothing fetched but a stream failed => surface it as an error rather than a
+  // benign "skipped" (which means "no configured work to do").
+  const status =
+    rawFiles.length > 0 ? "success" : warnings.length > 0 ? "error" : "skipped";
+
   const nextState = updateStateWithRun(
     {
       ...state,
@@ -188,16 +193,11 @@ async function ingest(
       at: new Date().toISOString(),
       rawFiles,
       runId,
-      status: rawFiles.length > 0 ? "success" : "skipped",
+      status,
       warnings,
     },
   );
   await writeConnectorState("x", nextState);
-
-  // Nothing fetched but a stream failed => surface it as an error rather than a
-  // benign "skipped" (which means "no configured work to do").
-  const status =
-    rawFiles.length > 0 ? "success" : warnings.length > 0 ? "error" : "skipped";
 
   return {
     connectorId: "x",

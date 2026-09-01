@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, test, vi } from "vitest";
@@ -30,6 +30,16 @@ async function writeXConfig(home: string, config: unknown): Promise<void> {
     `${JSON.stringify(config, null, 2)}\n`,
     "utf8",
   );
+}
+
+async function readXState(home: string): Promise<{
+  runs?: { status: string }[];
+}> {
+  const raw = await readFile(
+    path.join(home, ".openwiki", "connectors", "x", "state.json"),
+    "utf8",
+  );
+  return JSON.parse(raw) as { runs?: { status: string }[] };
 }
 
 async function loadXConnector(home: string) {
@@ -139,8 +149,10 @@ describe("x connector isolates per-stream failures", () => {
 
     const connector = await loadXConnector(home);
     const result = await connector.ingest();
+    const state = await readXState(home);
 
     expect(result.status).toBe("error");
+    expect(state.runs?.[0]?.status).toBe("error");
     expect(result.rawFiles).toHaveLength(0);
     expect(result.warnings.some((w) => w.startsWith("user_posts:"))).toBe(true);
   });
