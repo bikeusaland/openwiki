@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { installOpenRouterDebugFetch } from "../src/agent/index.ts";
-import { OPENROUTER_BASE_URL } from "../src/constants.ts";
+import { OPENROUTER_BASE_URL } from "../src/config/constants.ts";
 
 // ChatOpenRouter calls globalThis.fetch directly (no injectable fetch), so the
 // debug wrapper must patch the global. These tests pin the concurrency contract
